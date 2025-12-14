@@ -1,122 +1,148 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
-	"net"
-	"time"
 	"log"
+	"net"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 )
 
 const (
-	DISCOVERY_MESSAGE = "Who is JellyfinServer?"
-	DEFAULT_INTERVAL  = 30 * time.Second
+	PortNumber        = 7359
+	DiscoveryMessage  = "who is JellyfinServer?"
 )
 
+// ServerDiscoveryInfo matches the C# ServerDiscoveryInfo model
+type ServerDiscoveryInfo struct {
+	Address        string  `json:"Address"`
+	Id             string  `json:"Id"`
+	Name           string  `json:"Name"`
+	EndpointAddress *string `json:"EndpointAddress,omitempty"`
+}
+
 var (
-	remoteNetworks string
-	interval       time.Duration
+	serverURL        string
+	serverID         string
+	serverName       string
+	endpointAddress  string
 )
 
 func init() {
-	flag.StringVar(&remoteNetworks, "networks", "192.168.2.255:7359,192.168.3.255:7359", "Comma-separated list of remote network broadcast addresses and ports (e.g., 192.168.2.255:7359)")
-	flag.DurationVar(&interval, "interval", DEFAULT_INTERVAL, "Interval between discovery packet sends (e.g., 30s, 1m)")
+	flag.StringVar(&serverURL, "server-url", "", "The Jellyfin server URL (e.g., http://192.168.1.100:8096) (required)")
+	flag.StringVar(&serverID, "server-id", "", "Server identifier (GUID/UUID format) (required)")
+	flag.StringVar(&serverName, "server-name", "", "Friendly server name (required)")
+	flag.StringVar(&endpointAddress, "endpoint-address", "", "Optional endpoint address")
 	flag.Parse()
 }
 
-func sendDiscoveryPacket(networks []string) error {
-	// Get the local IP address
-	localIP := getLocalIP()
-	if localIP == nil {
-		log.Printf("Error getting local IP: no valid IP found")
-		return nil
+func main() {
+	// Validate required flags
+	if serverURL == "" {
+		log.Fatal("Error: -server-url is required")
+	}
+	if serverID == "" {
+		log.Fatal("Error: -server-id is required")
+	}
+	if serverName == "" {
+		log.Fatal("Error: -server-name is required")
 	}
 
-	// Create a UDP address for the local binding
-	localAddr := &net.UDPAddr{
-		IP:   localIP,
-		Port: 7359,
+	// Create context that cancels on interrupt
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle signals for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("Shutting down...")
+		cancel()
+	}()
+
+	// Start listening for discovery messages
+	if err := listenForAutoDiscoveryMessage(ctx); err != nil {
+		log.Fatalf("Failed to start discovery server: %v", err)
+	}
+}
+
+func listenForAutoDiscoveryMessage(ctx context.Context) error {
+	// Listen on all interfaces (0.0.0.0) on port 7359
+	listenAddr := &net.UDPAddr{
+		IP:   net.IPv4zero, // 0.0.0.0
+		Port: PortNumber,
 	}
 
-	// Listen on the local address
-	conn, err := net.ListenUDP("udp", localAddr)
+	conn, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
-		log.Printf("Error listening on UDP: %v", err)
 		return err
 	}
 	defer conn.Close()
 
-	// Set write buffer and deadline
-	conn.SetWriteBuffer(1024)
-	err = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err != nil {
-		log.Printf("Error setting deadline: %v", err)
-		return err
-	}
+	log.Printf("Listening for discovery requests on %s:%d", listenAddr.IP, PortNumber)
 
-	for _, addr := range networks {
-		log.Printf("Attempting to resolve %s", addr)
-		remoteAddr, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			log.Printf("Error resolving %s: %v", addr, err)
-			continue
-		}
+	buffer := make([]byte, 1024)
 
-		log.Printf("Resolved address: IP=%v, Port=%d", remoteAddr.IP, remoteAddr.Port)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Discovery socket operation cancelled")
+			return nil
+		default:
+			// Set read deadline to allow periodic context checks
+			// This allows us to check ctx.Done() periodically
+			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 
-		// Ensure the address is valid before sending
-		if remoteAddr.IP == nil || remoteAddr.Port == 0 {
-			log.Printf("Invalid address format for %s", addr)
-			continue
-		}
+			n, remoteAddr, err := conn.ReadFromUDP(buffer)
+			if err != nil {
+				// Check if it's a timeout (expected for periodic context checks)
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				// Log other errors but continue listening
+				log.Printf("Failed to receive data from socket: %v", err)
+				continue
+			}
 
-		log.Printf("Attempting to send to %s", addr)
-		_, err = conn.WriteToUDP([]byte(DISCOVERY_MESSAGE), remoteAddr)
-		if err != nil {
-			log.Printf("Error sending to %s: %v", addr, err)
-			continue
-		}
-		log.Printf("Sent discovery packet to %s", addr)
-	}
-
-	return nil
-}
-
-// getLocalIP returns the non-loopback local IP of the host
-func getLocalIP() net.IP {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return nil
-	}
-	for _, address := range addrs {
-		// Check if the address is a valid unicast IP
-		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				return ipnet.IP
+			// Check if the message contains the discovery request (case-insensitive)
+			message := strings.ToLower(string(buffer[:n]))
+			if strings.Contains(message, strings.ToLower(DiscoveryMessage)) {
+				log.Printf("Received discovery request from %s", remoteAddr)
+				if err := respondToDiscoveryMessage(remoteAddr, conn); err != nil {
+					log.Printf("Error sending response message: %v", err)
+				}
 			}
 		}
 	}
-	return nil
 }
 
-func main() {
-	// Split the comma-separated list of networks
-	networks := strings.Split(remoteNetworks, ",")
-	if len(networks) == 0 {
-		log.Fatal("No networks specified. Use -networks flag to provide a comma-separated list of addresses.")
+func respondToDiscoveryMessage(endpoint *net.UDPAddr, conn *net.UDPConn) error {
+	// Create the response with server information
+	var endpointAddrPtr *string
+	if endpointAddress != "" {
+		endpointAddrPtr = &endpointAddress
 	}
 
-	// Trim any whitespace from the network addresses
-	for i := range networks {
-		networks[i] = strings.TrimSpace(networks[i])
+	response := ServerDiscoveryInfo{
+		Address:        serverURL,
+		Id:             serverID,
+		Name:           serverName,
+		EndpointAddress: endpointAddrPtr,
 	}
 
-	for {
-		log.Printf("Starting discovery cycle with networks: %v", networks)
-		err := sendDiscoveryPacket(networks)
-		if err != nil {
-			log.Printf("Error in discovery packet send: %v", err)
-		}
-		time.Sleep(interval)
+	// Serialize to JSON
+	responseJSON, err := json.Marshal(response)
+	if err != nil {
+		return err
 	}
+
+	log.Printf("Sending AutoDiscovery response to %s", endpoint)
+	_, err = conn.WriteToUDP(responseJSON, endpoint)
+	return err
 }

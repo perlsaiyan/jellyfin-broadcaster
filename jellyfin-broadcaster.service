@@ -1,12 +1,12 @@
 [Unit]
-Description=Jellyfin Discovery Packet Broadcaster
+Description=Jellyfin Discovery Server
 After=network.target
 
 [Service]
 Type=simple
 # Uncomment and set User to run as a specific user (requires network permissions)
 # User=your-username
-ExecStart=/usr/local/bin/jellyfin-broadcaster -networks "192.168.2.255:7359,192.168.3.255:7359" -interval 30s
+ExecStart=/usr/local/bin/jellyfin-broadcaster -server-url "http://192.168.1.100:8096" -server-id "your-server-id-here" -server-name "Jellyfin Server"
 Restart=always
 RestartSec=10
 
