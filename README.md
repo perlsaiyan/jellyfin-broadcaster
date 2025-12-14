@@ -25,11 +25,16 @@ Jellyfin uses UDP port 7359 for server discovery, sending broadcast packets with
    ```bash
    git clone https://github.com/your-username/jellyfin-broadcaster.git
    cd jellyfin-broadcaster
-   go build main.go 
+   go build 
 
 ## Running
 
 ```bash
-./main -networks "192.168.88.255:7359" -interval 30s
+./jellyfin-broadcaster -networks "192.168.88.255:7359" -interval 30s
+```
+
+Or build and run in one step:
+```bash
+go run . -networks "192.168.88.255:7359" -interval 30s
 ```
 
